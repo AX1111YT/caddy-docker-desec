@@ -11,7 +11,7 @@ Use this image to handle Let's Encrypt DNS-01 challenges for wildcard certificat
 ```yaml
 services:
   caddy:
-    image: ghcr.io/ax1111yt/caddy-dns-desec:latest
+    image: ghcr.io/ax1111yt/caddy-desec:latest
     container_name: caddy
     restart: unless-stopped
     ports:
