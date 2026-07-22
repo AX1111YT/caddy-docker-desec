@@ -2,7 +2,7 @@
 
 Caddy Docker image with the `caddy-dns/desec` plugin pre-installed. 
 
-Use this image to handle Let's Encrypt DNS-01 challenges for wildcard certificates (`*.dedyn.io`) under deSEC. The image is rebuilt every week with GH actions.
+Use this image to handle Let's Encrypt DNS-01 challenges for wildcard certificates (`*.dedyn.io`) under deSEC. The image is rebuilt every week via GH actions.
 
 ## Quick Start
 
