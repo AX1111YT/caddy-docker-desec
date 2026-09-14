@@ -1,50 +1,164 @@
-name: Build and Push Custom Caddy Image
+name: Build and publish Caddy image
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'Dockerfile'
   schedule:
-    - cron: '0 0 * * 0'
+    - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: "Caddy version to build, e.g. 2.11.4 (blank = auto-detect latest release)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.windows"
+      - ".github/workflows/publish.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  resolve_version:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Determine target Caddy version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.caddy_version }}" ]; then
+            VERSION="${{ github.event.inputs.caddy_version }}"
+          else
+            VERSION=$(curl -fsSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/caddyserver/caddy/releases/latest \
+              | jq -r '.tag_name' | sed 's/^v//')
+          fi
+          echo "Resolved Caddy version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Downcase Repo Owner
-        id: repo_owner
-        run: echo "owner=${OWNER,,}" >> $GITHUB_OUTPUT
-        env:
-          OWNER: ${{ github.repository_owner }}
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && \
+             docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "Already published on schedule run — skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Build and Push
+  build_linux:
+    needs: resolve_version
+    if: needs.resolve_version.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: ""
+            suffix: ""
+          - variant: "-alpine"
+            suffix: "-alpine"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ matrix.suffix == '' && 'latest' || 'alpine' }}
+            type=semver,pattern={{version}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{major}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
+
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6,linux/ppc64le,linux/riscv64,linux/s390x
           push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CADDY_VERSION=${{ needs.resolve_version.outputs.version }}
+            VARIANT=${{ matrix.variant }}
+          cache-from: type=gha,scope=linux${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=linux${{ matrix.suffix }}
+
+  build_windows:
+    needs: resolve_version
+    if: needs.resolve_version.outputs.build == 'true'
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [windowsservercore, nanoserver]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            ghcr.io/${{ steps.repo_owner.outputs.owner }}/caddy-desec:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            type=raw,value=${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{version}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{major}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
+
+      - name: Build image
+        shell: bash
+        run: |
+          docker build \
+            --build-arg CADDY_VERSION=${{ needs.resolve_version.outputs.version }} \
+            --build-arg WINDOWS_TAG=ltsc2022 \
+            -f Dockerfile.windows \
+            --target ${{ matrix.base }} \
+            -t local-build \
+            .
+
+      - name: Tag and push
+        shell: bash
+        run: |
+          echo "${{ steps.meta.outputs.tags }}" | tr -d '\r' | while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker tag local-build "$tag"
+            docker push "$tag"
+          done
