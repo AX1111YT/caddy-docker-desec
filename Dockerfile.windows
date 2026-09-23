@@ -13,7 +13,7 @@ RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4; \
     & $xcaddy build "v$ver" --with github.com/caddy-dns/desec --output C:\caddy.exe
 
 FROM caddy:${CADDY_VERSION}-windowsservercore-${WINDOWS_TAG} AS windowsservercore
-COPY --from=builder C:\caddy.exe C:\caddy.exe
+COPY --from=builder C:/caddy.exe C:/caddy.exe
 
 FROM caddy:${CADDY_VERSION}-nanoserver-${WINDOWS_TAG} AS nanoserver
-COPY --from=builder C:\caddy.exe C:\caddy.exe
+COPY --from=builder C:/caddy.exe C:/caddy.exe
