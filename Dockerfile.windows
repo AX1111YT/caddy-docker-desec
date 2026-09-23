@@ -4,9 +4,13 @@ ARG WINDOWS_TAG=ltsc2022
 FROM caddy:${CADDY_VERSION}-builder-windowsservercore-${WINDOWS_TAG} AS builder
 ARG CADDY_VERSION
 
-RUN xcaddy build v${CADDY_VERSION#v} \
-      --with github.com/caddy-dns/desec \
-      --output C:\caddy.exe
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4; \
+    $gopath = (go env GOPATH).Trim(); \
+    $xcaddy = Join-Path $gopath 'bin\xcaddy.exe'; \
+    $ver = "$env:CADDY_VERSION".TrimStart('v'); \
+    & $xcaddy build "v$ver" --with github.com/caddy-dns/desec --output C:\caddy.exe
 
 FROM caddy:${CADDY_VERSION}-windowsservercore-${WINDOWS_TAG} AS windowsservercore
 COPY --from=builder C:\caddy.exe C:\caddy.exe
