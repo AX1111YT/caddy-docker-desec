@@ -244,8 +244,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm caddy-desec-smoke:local version
-          modules="$(docker run --rm caddy-desec-smoke:local list-modules)"
+          docker run --rm caddy-desec-smoke:local caddy version
+          modules="$(docker run --rm caddy-desec-smoke:local caddy list-modules)"
           grep --fixed-strings --line-regexp --quiet 'dns.providers.desec' <<< "${modules}"
 
       - name: Build and publish multi-platform Linux image
