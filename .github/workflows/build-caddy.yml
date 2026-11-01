@@ -2,73 +2,183 @@ name: Build and publish Caddy image
 
 on:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "0 0 * * 1"
   workflow_dispatch:
     inputs:
       caddy_version:
-        description: "Caddy version to build, e.g. 2.11.4 (blank = auto-detect latest release)"
+        description: "Caddy version to build (for example 2.11.4); leave blank to use the latest stable release"
         required: false
         type: string
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - "Dockerfile"
       - "Dockerfile.windows"
-      - ".github/workflows/publish.yml"
+      - ".github/workflows/build-caddy.yml"
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  DESEC_PLUGIN_VERSION: v1.1.0
 
 jobs:
-  resolve_version:
+  prepare:
+    name: Resolve versions and check release completeness
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      build: ${{ steps.check.outputs.build }}
+      caddy_version: ${{ steps.version.outputs.caddy_version }}
+      image: ${{ steps.version.outputs.image }}
+      should_build: ${{ steps.check.outputs.should_build }}
     steps:
-      - name: Determine target Caddy version
+      - name: Resolve Caddy version
         id: version
+        shell: bash
+        env:
+          REQUESTED_CADDY_VERSION: ${{ inputs.caddy_version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -n "${{ github.event.inputs.caddy_version }}" ]; then
-            VERSION="${{ github.event.inputs.caddy_version }}"
-          else
-            VERSION=$(curl -fsSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              https://api.github.com/repos/caddyserver/caddy/releases/latest \
-              | jq -r '.tag_name' | sed 's/^v//')
-          fi
-          echo "Resolved Caddy version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+          if [[ -n "${REQUESTED_CADDY_VERSION}" ]]; then
+            version="${REQUESTED_CADDY_VERSION#v}"
+          else
+            version="$(curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              https://api.github.com/repos/caddyserver/caddy/releases/latest \
+              | jq --exit-status --raw-output '.tag_name | ltrimstr("v")')"
+          fi
+
+          # Accept stable X.Y.Z versions only. This value is used in Docker tags
+          # and build arguments, so reject anything that is not a plain version.
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid Caddy version '${version}'. Expected X.Y.Z (optionally prefixed with v)." >&2
+            exit 1
+          fi
+
+          image="${GITHUB_REPOSITORY,,}"
+          echo "Resolved Caddy version: ${version}"
+          echo "Image: ${REGISTRY}/${image}"
+          echo "caddy_version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx for registry inspection
+        if: github.event_name == 'schedule'
+        uses: docker/setup-buildx-action@v4.3.0
+
+      - name: Log in to GHCR for registry inspection
+        if: github.event_name == 'schedule'
+        uses: docker/login-action@v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check whether this version is already published
+      - name: Check whether all expected image variants are published
         id: check
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CADDY_VERSION: ${{ steps.version.outputs.caddy_version }}
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.version.outputs.image }}
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && \
-             docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "Already published on schedule run — skipping."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "build=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          should_build=true
+
+          # Manual runs and pushes always build. Only scheduled runs may skip,
+          # and only when every expected image/tag is present and consistent.
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            expected_platforms='["linux/amd64","linux/arm64","linux/arm/v6","linux/arm/v7","linux/ppc64le","linux/riscv64","linux/s390x"]'
+
+            has_linux_platforms() {
+              local tag="$1"
+              local manifest
+
+              manifest="$(docker buildx imagetools inspect --raw "${IMAGE}:${tag}" 2>/dev/null)" || return 1
+
+              jq --exit-status --argjson expected "${expected_platforms}" '
+                [
+                  .manifests[]?.platform
+                  | select(.os == "linux")
+                  | if (.variant // "") == "" then
+                      "\(.os)/\(.architecture)"
+                    else
+                      "\(.os)/\(.architecture)/\(.variant)"
+                    end
+                ] as $actual
+                | ($expected - $actual | length) == 0
+              ' <<< "${manifest}" >/dev/null
+            }
+
+            manifest_digest() {
+              docker buildx imagetools inspect "${IMAGE}:$1" 2>/dev/null \
+                | awk '$1 == "Digest:" { print $2; exit }'
+            }
+
+            tags_match() {
+              local versioned_tag="$1"
+              local floating_tag="$2"
+              local versioned_digest
+              local floating_digest
+
+              versioned_digest="$(manifest_digest "${versioned_tag}")" || return 1
+              floating_digest="$(manifest_digest "${floating_tag}")" || return 1
+              [[ -n "${versioned_digest}" && "${versioned_digest}" == "${floating_digest}" ]]
+            }
+
+            complete=true
+
+            for tag in "${CADDY_VERSION}" "${CADDY_VERSION}-alpine"; do
+              if ! has_linux_platforms "${tag}"; then
+                echo "Missing or incomplete Linux image: ${IMAGE}:${tag}"
+                complete=false
+              fi
+            done
+
+            if ! tags_match "${CADDY_VERSION}" latest; then
+              echo "The latest tag is missing or does not match ${CADDY_VERSION}."
+              complete=false
+            fi
+
+            if ! tags_match "${CADDY_VERSION}-alpine" alpine; then
+              echo "The alpine tag is missing or does not match ${CADDY_VERSION}-alpine."
+              complete=false
+            fi
+
+            if ! tags_match \
+              "${CADDY_VERSION}-windowsservercore-ltsc2022" \
+              windowsservercore-ltsc2022; then
+              echo "The Windows Server Core image is missing or its floating tag is stale."
+              complete=false
+            fi
+
+            if ! tags_match \
+              "${CADDY_VERSION}-nanoserver-ltsc2022" \
+              nanoserver-ltsc2022; then
+              echo "The Nano Server image is missing or its floating tag is stale."
+              complete=false
+            fi
+
+            if [[ "${complete}" == "true" ]]; then
+              echo "All expected Linux platforms and Windows image variants are already published."
+              should_build=false
+            fi
           fi
 
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
+
   build_linux:
-    needs: resolve_version
-    if: needs.resolve_version.outputs.build == 'true'
+    name: Build Linux (${{ matrix.floating_tag }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -76,32 +186,70 @@ jobs:
         include:
           - variant: ""
             suffix: ""
+            floating_tag: latest
           - variant: "-alpine"
             suffix: "-alpine"
+            floating_tag: alpine
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.3.0
 
-      - uses: docker/login-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
+      - name: Generate Linux image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Keep the intended raw Linux tag, but disable metadata-action's
+          # implicit latest tag generation. Windows jobs use this same setting
+          # and must never be allowed to publish the generic Linux tags.
+          flavor: |
+            latest=false
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image }}
           tags: |
-            type=raw,value=${{ matrix.suffix == '' && 'latest' || 'alpine' }}
-            type=semver,pattern={{version}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
-            type=semver,pattern={{major}},value=${{ needs.resolve_version.outputs.version }},suffix=${{ matrix.suffix }}
+            type=raw,value=${{ matrix.floating_tag }}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.caddy_version }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.caddy_version }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.caddy_version }},suffix=${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.title=Caddy with deSEC DNS provider
+            org.opencontainers.image.description=Caddy built with the caddy-dns/desec DNS provider
+            org.opencontainers.image.version=${{ needs.prepare.outputs.caddy_version }}
+            io.github.ax1111yt.caddy-docker-desec.plugin-version=${{ env.DESEC_PLUGIN_VERSION }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build and load Linux smoke-test image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: caddy-desec-smoke:local
+          build-args: |
+            CADDY_VERSION=${{ needs.prepare.outputs.caddy_version }}
+            DESEC_PLUGIN_VERSION=${{ env.DESEC_PLUGIN_VERSION }}
+            VARIANT=${{ matrix.variant }}
+          cache-from: type=gha,scope=linux${{ matrix.suffix }}
+
+      - name: Verify Caddy binary and deSEC module
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm caddy-desec-smoke:local version
+          modules="$(docker run --rm caddy-desec-smoke:local list-modules)"
+          grep --fixed-strings --line-regexp --quiet 'dns.providers.desec' <<< "${modules}"
+
+      - name: Build and publish multi-platform Linux image
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: ./Dockerfile
@@ -110,55 +258,104 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CADDY_VERSION=${{ needs.resolve_version.outputs.version }}
+            CADDY_VERSION=${{ needs.prepare.outputs.caddy_version }}
+            DESEC_PLUGIN_VERSION=${{ env.DESEC_PLUGIN_VERSION }}
             VARIANT=${{ matrix.variant }}
           cache-from: type=gha,scope=linux${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=linux${{ matrix.suffix }}
+          sbom: true
+          provenance: mode=max
 
   build_windows:
-    needs: resolve_version
-    if: needs.resolve_version.outputs.build == 'true'
+    name: Build Windows (${{ matrix.base }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        base: [windowsservercore, nanoserver]
+        base:
+          - windowsservercore
+          - nanoserver
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
 
-      - uses: docker/login-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
+      - name: Generate Windows image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image }}
           tags: |
             type=raw,value=${{ matrix.base }}-ltsc2022
-            type=semver,pattern={{version}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
-            type=semver,pattern={{major}},value=${{ needs.resolve_version.outputs.version }},suffix=-${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.caddy_version }},suffix=-${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.caddy_version }},suffix=-${{ matrix.base }}-ltsc2022
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.caddy_version }},suffix=-${{ matrix.base }}-ltsc2022
+          labels: |
+            org.opencontainers.image.title=Caddy with deSEC DNS provider
+            org.opencontainers.image.description=Caddy Windows image built with the caddy-dns/desec DNS provider
+            org.opencontainers.image.version=${{ needs.prepare.outputs.caddy_version }}
+            io.github.ax1111yt.caddy-docker-desec.plugin-version=${{ env.DESEC_PLUGIN_VERSION }}
 
-      - name: Build image
+      - name: Build Windows image
         shell: bash
+        env:
+          CADDY_VERSION: ${{ needs.prepare.outputs.caddy_version }}
+          DESEC_PLUGIN_VERSION: ${{ env.DESEC_PLUGIN_VERSION }}
+          BUILD_TARGET: ${{ matrix.base }}
+          IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
         run: |
+          set -euo pipefail
+
+          label_args=()
+          while IFS= read -r label; do
+            [[ -z "${label}" ]] && continue
+            label_args+=(--label "${label}")
+          done <<< "${IMAGE_LABELS}"
+
           docker build \
-            --build-arg CADDY_VERSION=${{ needs.resolve_version.outputs.version }} \
+            --build-arg "CADDY_VERSION=${CADDY_VERSION}" \
+            --build-arg "DESEC_PLUGIN_VERSION=${DESEC_PLUGIN_VERSION}" \
             --build-arg WINDOWS_TAG=ltsc2022 \
+            --target "${BUILD_TARGET}" \
+            "${label_args[@]}" \
             -f Dockerfile.windows \
-            --target ${{ matrix.base }} \
             -t local-build \
             .
 
-      - name: Tag and push
+          image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' local-build)"
+          if [[ "${image_platform}" != "windows/amd64" ]]; then
+            echo "Expected a Windows/amd64 image, got ${image_platform}." >&2
+            exit 1
+          fi
+
+      - name: Verify Windows Caddy binary and deSEC module
         shell: bash
         run: |
-          echo "${{ steps.meta.outputs.tags }}" | tr -d '\r' | while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            docker tag local-build "$tag"
-            docker push "$tag"
-          done
+          set -euo pipefail
+          docker run --rm local-build version
+          modules="$(docker run --rm local-build list-modules)"
+          grep --fixed-strings --line-regexp --quiet 'dns.providers.desec' <<< "${modules}"
+
+      - name: Tag and push Windows image
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            echo "Publishing ${tag}"
+            docker tag local-build "${tag}"
+            docker push "${tag}"
+          done <<< "${TAGS}"
